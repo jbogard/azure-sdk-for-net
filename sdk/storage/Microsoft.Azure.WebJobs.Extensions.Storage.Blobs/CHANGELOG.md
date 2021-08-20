@@ -1,7 +1,7 @@
 # Release History
 
 ## 5.0.0-beta.6 (Unreleased)
-
+- Adding Dynamic Concurrency support.
 
 ## 5.0.0-beta.5 (2021-07-09)
 - This release contains bug fixes to improve quality.

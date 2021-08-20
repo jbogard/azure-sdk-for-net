@@ -2,7 +2,9 @@
 // Licensed under the MIT License.
 
 using System;
+using System.Collections.Generic;
 using System.Linq;
+using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
 using Azure;
@@ -14,8 +16,11 @@ using Azure.Storage.Queues.Models;
 using Microsoft.Azure.WebJobs.Extensions.Storage.Common.Tests;
 using Microsoft.Azure.WebJobs.Host;
 using Microsoft.Azure.WebJobs.Host.Queues;
+using Microsoft.Azure.WebJobs.Host.Scale;
+using Microsoft.Azure.WebJobs.Logging;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using Newtonsoft.Json;
 using NUnit.Framework;
 
@@ -33,6 +38,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.Storage.ScenarioTests
         private const string TableName = TestArtifactsPrefix + "table%rnd%";
 
         private const string HostStartQueueName = TestArtifactsPrefix + "startqueue%rnd%";
+        private const string DynamicConcurrencyQueueName = TestArtifactsPrefix + "queue%rnd%";
         private const string TestQueueName = TestArtifactsPrefix + "queue%rnd%";
         private const string TestQueueNameEtag = TestArtifactsPrefix + "etag2equeue%rnd%";
         private const string DoneQueueName = TestArtifactsPrefix + "donequeue%rnd%";
@@ -160,7 +166,79 @@ namespace Microsoft.Azure.WebJobs.Extensions.Storage.ScenarioTests
             await EndToEndTest(uploadBlobBeforeHostStart: true);
         }
 
-        private async Task EndToEndTest(bool uploadBlobBeforeHostStart)
+        [Test]
+        [Category("DynamicConcurrency")]
+        public async Task AzureStorageEndToEnd_DynamicConcurrency()
+        {
+            await EndToEndTest(uploadBlobBeforeHostStart: true, b =>
+            {
+                b.Services.AddOptions<ConcurrencyOptions>().Configure(options =>
+                {
+                    options.DynamicConcurrencyEnabled = true;
+                });
+            });
+        }
+
+        [Test]
+        [Category("DynamicConcurrency")]
+        public async Task DynamicConcurrency_Queues()
+        {
+            // Reinitialize the name resolver to avoid conflicts
+            _resolver = new RandomNameResolver();
+
+            IHost host = new HostBuilder()
+                .ConfigureDefaultTestHost<DynamicConcurrencyTestJob>(b =>
+                {
+                    b.AddAzureStorageQueues();
+
+                    b.Services.AddOptions<ConcurrencyOptions>().Configure(options =>
+                    {
+                        options.DynamicConcurrencyEnabled = true;
+                    });
+                })
+                .ConfigureServices(services =>
+                {
+                    services.AddSingleton<INameResolver>(_resolver);
+                })
+                .ConfigureLogging((context, b) =>
+                {
+                    b.SetMinimumLevel(LogLevel.Debug);
+                })
+                .Build();
+
+            MethodInfo methodInfo = typeof(DynamicConcurrencyTestJob).GetMethod("ProcessMessage", BindingFlags.Public | BindingFlags.Static);
+            string functionId = $"{methodInfo.DeclaringType.FullName}.{methodInfo.Name}";
+            var concurrencyManager = host.Services.GetServices<ConcurrencyManager>().SingleOrDefault();
+            var concurrencyStatus = concurrencyManager.GetStatus(functionId);
+            Assert.AreEqual(1, concurrencyStatus.CurrentConcurrency);
+
+            // write a bunch of queue messages
+            int numMessages = 250;
+            string queueName = _resolver.ResolveInString(DynamicConcurrencyQueueName);
+            await WriteQueueMessages(queueName, numMessages);
+
+            // start the host
+            await host.StartAsync();
+
+            // wait for all messages to be processed
+            await TestHelpers.Await(() =>
+            {
+                return DynamicConcurrencyTestJob.InvocationCount >= numMessages;
+            });
+
+            await host.StopAsync();
+
+            // ensure we've dynamically increased concurrency
+            concurrencyStatus = concurrencyManager.GetStatus(functionId);
+            Assert.GreaterOrEqual(concurrencyStatus.CurrentConcurrency, 10);
+
+            // check a few of the concurrency logs
+            var concurrencyLogs = host.GetTestLoggerProvider().GetAllLogMessages().Where(p => p.Category == LogCategories.Concurrency).Select(p => p.FormattedMessage).ToList();
+            int concurrencyIncreaseLogCount = concurrencyLogs.Count(p => p.Contains("ProcessMessage Increasing concurrency"));
+            Assert.GreaterOrEqual(concurrencyIncreaseLogCount, 3);
+        }
+
+        private async Task EndToEndTest(bool uploadBlobBeforeHostStart, Action<IWebJobsBuilder> additionalSetup = null)
         {
             // Reinitialize the name resolver to avoid conflicts
             _resolver = new RandomNameResolver();
@@ -169,6 +247,8 @@ namespace Microsoft.Azure.WebJobs.Extensions.Storage.ScenarioTests
                 .ConfigureDefaultTestHost<AzureStorageEndToEndTests>(b =>
                 {
                     b.AddAzureStorageBlobs().AddAzureStorageQueues();
+
+                    additionalSetup?.Invoke(b);
                 })
                 .ConfigureServices(services =>
                 {
@@ -305,6 +385,34 @@ namespace Microsoft.Azure.WebJobs.Extensions.Storage.ScenarioTests
             _startWaitHandle.WaitOne(30000);
         }
 
+        private async Task WriteQueueMessages(string queueName, int numMessages)
+        {
+            QueueClient queue = _queueServiceClient.GetQueueClient(queueName);
+            await queue.CreateIfNotExistsAsync();
+
+            int numThreads = 10;
+            if (numMessages <= numThreads)
+            {
+                numThreads = 1;
+            }
+            int messagesPerThread = numMessages / numThreads;
+            List<Task> tasks = new List<Task>();
+            for (int i = 0; i < numThreads; i++)
+            {
+                tasks.Add(AddMessagesAsync(messagesPerThread, queue));
+            }
+
+            await Task.WhenAll(tasks);
+        }
+
+        private static async Task AddMessagesAsync(int numMessages, QueueClient queue)
+        {
+            for (int i = 0; i < numMessages; i++)
+            {
+                await queue.SendMessageAsync(Guid.NewGuid().ToString());
+            }
+        }
+
         private class TestQueueProcessorFactory : IQueueProcessorFactory
         {
             public QueueProcessor Create(QueueProcessorOptions context)
@@ -375,6 +483,18 @@ namespace Microsoft.Azure.WebJobs.Extensions.Storage.ScenarioTests
                 {
                     this.QueueServiceClient.GetQueueClient(testQueue.Name).Delete();
                 }
+            }
+        }
+
+        public class DynamicConcurrencyTestJob
+        {
+            public static int InvocationCount;
+
+            public static async Task ProcessMessage([QueueTrigger(DynamicConcurrencyQueueName)] string input)
+            {
+                await Task.Delay(250);
+
+                Interlocked.Increment(ref InvocationCount);
             }
         }
     }
